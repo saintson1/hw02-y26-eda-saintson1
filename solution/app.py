@@ -1,196 +1,136 @@
+"""Интерактивное исследование ДТП: make run."""
+import hashlib
+import json
 from pathlib import Path
 
 import pandas as pd
-import plotly.express as px
 import streamlit as st
 
+import charts
 from data_loading import load_records, records_to_frame
+from projections import compute_projections, pca_figure, tsne_figure
+from stats import run_hypotheses
 
 ROOT = Path(__file__).resolve().parents[1]
-DATA_DIR = ROOT / "data" / "raw"
-FILTER_PREFIX = "filter_"
-LABELS = {"region": "Территория", "category": "Тип ДТП", "severity": "Последствия"}
-
-st.set_page_config(page_title="Атлас аварийности", page_icon="🗺️", layout="wide")
+SOURCE = ROOT / 'data/raw/nizhegorodskaia-oblast.geojson'
+st.set_page_config(page_title='ДТП, Нижегородская область', layout='wide')
 
 
-@st.cache_data(show_spinner="Читаем выгрузку…")
-def read_data(path: str, modified_ns: int, size: int) -> tuple[list[dict], pd.DataFrame]:
-    records = load_records(Path(path))
-    return records, records_to_frame(records)
+@st.cache_data(show_spinner='Загрузка данных...')
+def read_frame(path, modified_ns):
+    with open(path, 'rb') as source:
+        digest = hashlib.file_digest(source, 'sha256').hexdigest()
+    return records_to_frame(load_records(Path(path))), digest
 
 
-def reset_filters() -> None:
+@st.cache_data(show_spinner='Расчёт гипотез и проекций...')
+def fixed_analysis(_frame, digest):
+    results_path = ROOT / 'solution/results.json'
+    projection_path = ROOT / 'solution/cache/projections.csv'
+    if results_path.exists() and projection_path.exists():
+        results = json.loads(results_path.read_text())
+        if results['source_sha256'] == digest:
+            return results['hypotheses'], dict(results['projections'], data=pd.read_csv(projection_path))
+    return run_hypotheses(_frame), compute_projections(_frame)
+
+
+def show(figure):
+    if figure is None:
+        st.info('Недостаточно данных для сравнения.')
+    else:
+        st.plotly_chart(figure, width='stretch')
+
+
+def reset_filters():
     for key in list(st.session_state):
-        if str(key).startswith(FILTER_PREFIX):
+        if key.startswith('filter_'):
             del st.session_state[key]
 
 
-def main() -> None:
-    st.title("Атлас аварийности")
-    st.caption("Каркас ДЗ 2 · данные вашего региона")
-    st.info(
-        "Здесь можно посмотреть выгрузку и выбрать данные для анализа. Добавьте свои графики, "
-        "проверки гипотез и выводы по заданию."
-    )
-    files = sorted(DATA_DIR.glob("*.geojson")) + sorted(DATA_DIR.glob("*.json"))
-    files = [p for p in files if not p.name.endswith(".source.json")]
-    if not files:
-        st.warning("В data/raw пока нет выгрузки. Скачайте файл своего региона.")
-        st.code(
-            "python data/assign_region.py YOUR_GITHUB_USERNAME\n"
-            "python data/import_data.py /path/to/region.geojson.zip",
-            language="bash",
-        )
-        st.link_button("Открыть данные «Карты ДТП»", "https://dtp-stat.ru/opendata/")
-        st.markdown("Инструкция находится в `data/README.md` репозитория.")
+def main():
+    st.title('ДТП в Нижегородской области')
+    st.caption('saintson1, одно наблюдение - одно зарегистрированное ДТП')
+    if not SOURCE.exists():
+        st.info('Загрузите данные: .venv/bin/python data/download_data.py')
         return
-
-    selected_path = st.sidebar.selectbox(
-        "Выгрузка", files, format_func=lambda p: p.name,
-        key="source_file", on_change=reset_filters,
-    )
     try:
-        stat = selected_path.stat()
-        records, frame = read_data(str(selected_path), stat.st_mtime_ns, stat.st_size)
+        frame, digest = read_frame(str(SOURCE), SOURCE.stat().st_mtime_ns)
     except (ValueError, OSError, TypeError) as error:
-        st.error(f"Не удалось прочитать выгрузку: {error}")
+        st.error(str(error))
         return
-    if frame.empty:
-        st.warning("Файл содержит пустой список записей.")
-        return
-
-    invalid_dates = int(frame["datetime"].isna().sum())
-    duplicate_ids = int(frame.loc[frame["id"].notna(), "id"].duplicated().sum())
-    st.sidebar.caption(f"Исходных записей: {len(frame):,}")
-    st.sidebar.caption(
-        f"Без распознанной даты: {invalid_dates:,}. "
-        f"Повторных непустых ID: {duplicate_ids:,}. Дубликаты не удалены."
-    )
-    dated = frame[frame["datetime"].notna()]
+    dated = frame.dropna(subset=['datetime'])
     if dated.empty:
-        st.error("Нет распознанных дат. Проверьте исходный формат и загрузчик.")
-        st.dataframe(frame.head(20), hide_index=True)
+        st.info('Нет записей с распознанной датой.')
         return
-
-    first, last = dated["datetime"].min().date(), dated["datetime"].max().date()
-    st.sidebar.button("Сбросить фильтры", on_click=reset_filters)
-    period = st.sidebar.date_input(
-        "Период", value=(first, last), min_value=first, max_value=last,
-        key="filter_period",
-    )
+    first, last = dated.datetime.min().date(), dated.datetime.max().date()
+    st.sidebar.button('Сбросить фильтры', on_click=reset_filters)
+    period = st.sidebar.date_input('Период', (first, last), min_value=first, max_value=last, key='filter_period')
     if len(period) != 2:
-        st.info("Выберите начало и конец периода.")
+        st.info('Выберите обе границы периода.')
         return
     start, end = period
-    current = dated[
-        (dated["datetime"] >= pd.Timestamp(start))
-        & (dated["datetime"] < pd.Timestamp(end) + pd.Timedelta(days=1))
-    ].copy()
-    for column, title in list(LABELS.items())[:2]:
-        include_all = st.sidebar.checkbox(
-            "Все территории" if column == "region" else "Все типы ДТП",
-            value=True, key=f"filter_all_{column}",
-        )
-        if include_all:
-            continue
-        values = frame[column]
-        options = sorted(values.dropna().astype(str).unique().tolist())
-        if values.isna().any():
-            options.append(None)
-        selected = st.sidebar.multiselect(
-            title, options, default=[],
-            format_func=lambda value: "〈значение отсутствует〉" if value is None else value,
-            key=f"filter_{column}",
-        )
-        mask = current[column].astype("string").isin([v for v in selected if v is not None])
-        if None in selected:
-            mask |= current[column].isna()
-        current = current[mask].copy()
-
-    st.caption(
-        f"Период: {start:%d.%m.%Y} - {end:%d.%m.%Y}. "
-        "Ниже показаны данные с учётом фильтров. Исходные записи посчитаны "
-        "без автоматической очистки."
-    )
-    if invalid_dates:
-        st.warning(f"Из фильтра по времени исключено записей без даты: {invalid_dates:,}.")
+    current = dated[(dated.datetime >= pd.Timestamp(start)) &
+                    (dated.datetime < pd.Timestamp(end) + pd.Timedelta(days=1))]
+    for column, title, all_label in [('region', 'Территория', 'Все территории'),
+                                      ('category', 'Тип ДТП', 'Все типы ДТП')]:
+        if not st.sidebar.checkbox(all_label, value=True, key=f'filter_all_{column}'):
+            selected = st.sidebar.multiselect(title, sorted(frame[column].dropna().unique()), key=f'filter_{column}')
+            current = current[current[column].isin(selected)]
     if current.empty:
-        st.warning("В выбранном срезе нет записей. Измените или сбросьте фильтры.")
+        st.info('В выбранном срезе нет ДТП.')
         return
-    a, b, c = st.columns(3)
-    a.metric("Записей в срезе", f"{len(current):,}")
-    b.metric("Уникальных непустых ID", f"{current['id'].nunique():,}")
-    c.metric("Без пригодных для карты координат", f"{int((~current['map_valid']).sum()):,}")
-    if len(current) < 30:
-        st.warning(
-            "В выборке меньше 30 записей. Посмотрите, как отдельные ДТП влияют на результат. "
-            "Число 30 здесь выбрано для напоминания, а не как критерий надёжности."
-        )
-
-    overview, geography, source = st.tabs(["Динамика", "Карта", "Исходные записи"])
+    st.caption(f'{start:%d.%m.%Y}-{end:%d.%m.%Y}, графики и карты учитывают фильтры')
+    values = [('ДТП', len(current)), ('Раненые', current.injured_count.sum()),
+              ('ДТП с погибшими', current.fatal.sum()), ('Непригодные координаты', (~current.map_valid).sum())]
+    for column, (label, value) in zip(st.columns(4), values):
+        column.metric(label, f'{int(value):,}')
+    overview, questions, geography, hypotheses, projections, data = st.tabs(
+        ['Обзор', 'Вопросы исследования', 'Карта', 'Три гипотезы', 'PCA и t-SNE', 'Данные'])
     with overview:
-        counts = current.set_index("datetime").resample("MS").size().rename("records")
-        months = pd.date_range(pd.Timestamp(start).to_period("M").start_time,
-                               pd.Timestamp(end).to_period("M").start_time, freq="MS")
-        counts = counts.reindex(months, fill_value=0).rename_axis("month").reset_index()
-        fig = px.line(counts, x="month", y="records", markers=True,
-                      labels={"month": "Месяц", "records": "Число исходных записей"})
-        st.subheader("Число записей по месяцам")
-        st.plotly_chart(fig, width="stretch")
-        st.caption(
-            "Ноль на графике означает, что за этот месяц в выбранных данных нет записей. "
-            "Первый и последний месяцы могут быть неполными. "
-            "Перед сравнением проверьте, за все ли месяцы данные собраны полностью."
-        )
+        show(charts.monthly(current, start, end))
+        st.caption('2026 год содержит только январь. крайние месяцы фильтра могут быть неполными.')
+        for figure in [charts.categories(current), charts.injured_ecdf(current), charts.hour_weekday(current)]:
+            show(figure)
+    with questions:
+        show(charts.night_by_weekday(current))
+        st.write('После сравнения ночной доли я отдельно сравнил число раненых в столкновениях.')
+        show(charts.night_collision_injuries(current))
+        show(charts.pedestrian_seasons(current[current.year.between(2015, 2025)]))
+        st.caption('Сезонное сравнение исключает неполный 2026 год.')
+        show(charts.participants_injured(current))
     with geography:
-        points = current[current["map_valid"]].copy()
-        if points.empty:
-            st.info("В срезе нет пригодных для карты координат.")
-        else:
-            if len(points) > 5000:
-                points = points.sample(5000, random_state=42)
-                st.warning(
-                    "Для быстрого просмотра показана случайная подвыборка 5 000 точек. "
-                    "Остальные показатели и CSV используют полный срез."
-                )
-            backdrop = st.checkbox("Показывать подложку карты", value=True)
-            points["severity_display"] = points["severity"].fillna("〈значение отсутствует〉")
-            fig = px.scatter_map(
-                points, lat="latitude", lon="longitude", color="severity_display",
-                color_discrete_map={
-                    "Легкий": "#3579B8", "Тяжёлый": "#C18A16",
-                    "С погибшими": "#B33440", "〈значение отсутствует〉": "#8D939C",
-                },
-                category_orders={"severity_display": ["Легкий", "Тяжёлый", "С погибшими"]},
-                hover_data=["source_row", "id", "datetime", "category", "region"],
-                labels={"severity_display": "Последствия", **LABELS},
-                opacity=0.6, zoom=5,
-                center={"lat": float(points["latitude"].median()),
-                        "lon": float(points["longitude"].median())},
-                map_style="open-street-map" if backdrop else "white-bg", height=540,
-            )
-            st.plotly_chart(fig, width="stretch")
-            st.caption(
-                "Подложка: © OpenStreetMap contributors, https://www.openstreetmap.org/copyright. "
-                "Координаты взяты из выгрузки; принадлежность региону здесь не проверена."
-            )
-    with source:
-        columns = ["source_row", "id", "datetime", "region", "category", "severity",
-                   "participants_count", "injured_count", "dead_count", "latitude", "longitude"]
-        st.dataframe(current[columns].head(500), hide_index=True, width="stretch")
-        st.caption("Первые 500 записей текущего среза; CSV содержит весь срез.")
-        st.download_button(
-            "Скачать текущий срез CSV", current[columns].to_csv(index=False).encode("utf-8-sig"),
-            file_name="selected_records.csv", mime="text/csv",
-        )
-        lookup = current.set_index("source_row")
-        chosen = st.selectbox(
-            "Открыть исходную запись", current["source_row"].tolist(),
-            format_func=lambda index: f"Строка {index} · ID {lookup.at[index, 'id']}",
-        )
-        st.json(records[int(chosen)], expanded=False)
+        backdrop = st.checkbox('Подложка OpenStreetMap', value=True)
+        show(charts.point_map(current, backdrop))
+        show(charts.grid_map(current, backdrop=backdrop))
+        st.caption('Сетка 5 на 5 км, EPSG:32638. (c) OpenStreetMap contributors - https://www.openstreetmap.org/copyright')
+    checked, projected = fixed_analysis(frame, digest)
+    with hypotheses:
+        st.caption(f'2015-2025, {checked["full_year_rows"]:,} ДТП, фильтры не применяются')
+        for item in checked['results']:
+            st.markdown(f'**{item["id"]}. {item["question"]}**')
+            st.write(f'{item["group_a"]}: n={item["n_a"]:,}. {item["group_b"]}: n={item["n_b"]:,}.')
+            st.write(f'{item["test"]}: p={item["p_value"]:.4g}. Разность {item["effect"]:+.3f} {item["unit"]}. '
+                     f'95% доверительный интервал от {item["ci_low"]:+.3f} до {item["ci_high"]:+.3f}.')
+            st.caption('Я отвергаю H0.' if item['reject'] else 'Я не отвергаю H0.')
+        st.caption('H0 - равенство долей или средних, H1 - различие. Уровень значимости 0,05. Bootstrap: 5000 повторов '
+                   'целых ДТП. Перестановки: 9999. p=(b+1)/10000. Ночь: 22:00-05:59, выходные: сб-вс.')
+    with projections:
+        metadata = projected['metadata']
+        st.caption(f'{metadata["sample_rows"]} ДТП 2015-2025, seed=42, фильтры не применяются')
+        st.write('Я стандартизировал числа участников и ТС, тип и освещение закодировал OHE. Последствия использовал только для цвета.')
+        show(pca_figure(projected))
+        with st.expander('Коэффициенты PCA'):
+            st.dataframe(pd.DataFrame(metadata['pca']['components'], index=['PC1', 'PC2'], columns=metadata['features']).T)
+        show(tsne_figure(projected))
+        st.caption('Perplexity 15/40, init=pca, learning_rate=auto, 1000 итераций. Пятна не доказывают кластеры.')
+    with data:
+        st.markdown('[Источник: "Карта ДТП"](https://dtp-stat.ru/download/). Период: 01.01.2015-31.01.2026.')
+        st.write(f'Я исправил {int(frame.coordinates_swapped.sum())} перепутанных пар координат. '
+                 f'Из карт исключил {int((~frame.map_valid).sum())} записей.')
+        st.write('Я проверил долготу от 41 до 49 и широту от 54 до 59. Последствия определял по числу погибших и раненых.')
+        st.caption('Полный отчёт: solution/analysis.md. Без данных о потоке нельзя оценить риск поездки.')
+        st.dataframe(current[['id', 'datetime', 'region', 'category', 'injured_count', 'dead_count']].head(100), hide_index=True)
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()

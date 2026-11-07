@@ -1,4 +1,4 @@
-.PHONY: install run
+.PHONY: install run analyze check
 
 PYTHON ?= python3
 VENV ?= .venv
@@ -9,3 +9,9 @@ install:
 
 run:
 	$(VENV)/bin/python -m streamlit run solution/app.py
+
+analyze:
+	$(VENV)/bin/python solution/analyze.py
+
+check:
+	$(VENV)/bin/python solution/checks.py
